@@ -1,0 +1,187 @@
+##### Start with a clean beaker
+
+
+
+sudo subscription-manager register
+sudo subscription-manager list --available --all --matches="Red Hat OpenStack"
+sudo subscription-manager attach --pool=Valid-Pool-Number-123456
+sudo subscription-manager repos --disable=*
+sudo subscription-manager repos --enable=rhel-7-server-rpms --enable=rhel-7-server-extras-rpms --enable=rhel-7-server-rh-common-rpms --enable=rhel-ha-for-rhel-7-server-rpms --enable=rhel-7-server-openstack-13-rpms
+
+
+
+yum -y install libvirt qemu-kvm virt-manager virt-install libguestfs-tools libguestfs-xfs net-tools python-setuptools ipmitool vim-enhanced screen
+
+
+
+cd /var/lib/libvirt/images/
+df -h
+mkdir /home/images
+chcon -t virt_image_t /home/images/
+systemctl status libvirtd
+systemctl start libvirtd
+
+
+cd /home/images
+qemu-img create -f qcow2 rhel7-guest.qcow2 40G
+virt-resize --expand /dev/sda1 rhel-server-7.5-x86_64-kvm.qcow2 rhel7-guest.qcow2
+qemu-img create -f qcow2 -b rhel7-guest.qcow2 undercloud.qcow2
+virt-customize -a undercloud.qcow2 --root-password password:redhat --uninstall cloud-init
+virt-install --ram 8192 --vcpus 4 --os-variant rhel7 --disk path=/home/images/undercloud.qcow2,device=disk,bus=virtio,format=qcow2 --import --noautoconsole --vnc --network network:default --name undercloud
+virsh start undercloud
+qemu-img create -f qcow2 -o preallocation=metadata overcloud-controller.qcow2 60G
+qemu-img create -f qcow2 -o preallocation=metadata overcloud-compute.qcow2 60G
+
+
+virt-install --ram 8192 --vcpus 2 --os-variant rhel7 --disk path=/home/images/overcloud-controller.qcow2,device=disk,bus=virtio,format=qcow2 --noautoconsole --vnc --network network:default --name overcloud-controller --cpu SandyBridge,+vmx --dry-run --print-xml > /tmp/overcloud-controller.xml
+virt-install --ram 8192 --vcpus 2 --os-variant rhel7 --disk path=/home/images/overcloud-compute.qcow2,device=disk,bus=virtio,format=qcow2 --noautoconsole --vnc --network network:default --name overcloud-compute --cpu SandyBridge,+vmx --dry-run --print-xml > /tmp/overcloud-compute.xml
+virsh define --file /tmp/overcloud-controller.xml
+virsh define --file /tmp/overcloud-compute.xml
+
+
+
+
+yum install openvswitch python-virtualbmc -y
+systemctl start openvswitch
+ovs-vsctl add-br brbm
+ifconfig brbm 192.168.24.254/24
+
+
+virsh attach-interface --domain undercloud --type bridge --source brbm --model virtio --config
+virt-xml undercloud --edit 2 --network virtualport_type=openvswitch
+virsh attach-interface --domain overcloud-controller --type bridge --source brbm --model virtio --config
+virt-xml overcloud-controller --edit 2 --network virtualport_type=openvswitch
+virsh attach-interface --domain overcloud-compute --type bridge --source brbm --model virtio --config
+virt-xml overcloud-compute --edit 2 --network virtualport_type=openvswitch
+
+
+
+ovs-vsctl add-br vswitch
+ovs-vsctl add-port vswitch external tag=10 -- set Interface external type=internal
+ovs-vsctl add-port vswitch storage tag=20 -- set Interface storage type=internal
+ovs-vsctl add-port vswitch api tag=30 -- set Interface api type=internal
+ovs-vsctl add-port vswitch storage_mgmt tag=40 -- set Interface storage_mgmt type=internal
+ovs-vsctl add-port vswitch tenant tag=50 -- set Interface tenant type=internal
+ovs-vsctl list-ports vswitch
+
+
+
+ifconfig external 10.11.48.254/24;ifconfig api 192.168.124.254/24; ifconfig tenant 192.168.123.254/24; ifconfig storage_mgmt 192.168.128.254/24; ifconfig storage 192.168.125.254/24
+
+
+
+route -n
+ifconfig
+
+
+
+for i in {overcloud-controller,overcloud-compute}; do virsh attach-interface --domain $i --type bridge --source vswitch --model virtio --config ;done
+for i in {overcloud-controller,overcloud-compute}; do virt-xml $i --edit 3 --network virtualport_type=openvswitch ;done
+
+
+
+
+ssh root@<undercloud_ip>
+
+
+
+>> Creating user and giving root privileges
+# useradd stack
+# echo "redhat" | passwd stack --stdin
+# echo "stack ALL=(root) NOPASSWD:ALL" | tee -a /etc/sudoers.d/stack
+# chmod 0440 /etc/sudoers.d/stack
+# su - stack
+
+
+# mkdir ~/images
+# mkdir ~/templates
+
+
+
+>> Setting up Hostname
+
+# sudo hostnamectl set-hostname undercloud.example.com
+# sudo hostnamectl set-hostname --transient undercloud.example.com
+
+
+
+
+>> Adding subscription and enabling repo
+
+# sudo subscription-manager register
+# sudo subscription-manager list --available --all --matches="Red Hat OpenStack"
+# sudo subscription-manager attach --pool=Valid-Pool-Number-123456
+# sudo subscription-manager repos --disable=*
+# sudo subscription-manager repos --enable=rhel-7-server-rpms --enable=rhel-7-server-extras-rpms --enable=rhel-7-server-rh-common-rpms --enable=rhel-ha-for-rhel-7-server-rpms --enable=rhel-7-server-openstack-13-rpms
+
+
+>> Install tripleo packages and ceph-ansible packages
+
+# sudo yum install -y python-tripleoclient ceph-ansible
+
+
+
+
+
+>> Write undercloud.conf file
+
+# vi undercloud.conf
+          [DEFAULT]
+          # Network interface on the Undercloud that will be handling the PXE
+          # boots and DHCP for Overcloud instances. (string value)
+          local_interface = eth1
+          local_ip = 192.168.24.1/24
+          undercloud_public_host = 192.168.24.2
+          undercloud_admin_host = 192.168.24.3
+          undercloud_ntp_servers=clock.redhat.com
+          [ctlplane-subnet]
+          local_subnet = ctlplane-subnet
+          cidr = 192.168.24.0/24
+          dhcp_start = 192.168.24.5
+          dhcp_end = 192.168.24.24
+          gateway = 192.168.24.1
+          inspection_iprange = 192.168.24.100,192.168.24.120
+          masquerade = true
+
+
+>> Install undercloud
+
+#  openstack undercloud install
+
+
+
+
+>> Download overcloud images and upload and extract and upload
+
+# source ~/stackrc
+# sudo yum install rhosp-director-images rhosp-director-images-ipa
+# cd ~/images
+# for i in /usr/share/rhosp-director-images/overcloud-full-latest-13.0.tar /usr/share/rhosp-director-images/ironic-python-agent-latest-13.0.tar; do tar -xvf $i; done
+# openstack overcloud image upload --image-path /home/stack/images/
+
+
+
+
+
+>> Set namespace to ctlplane-subnet
+# openstack subnet set --dns-nameserver 8.8.8.8 ctlplane-subnet
+
+# cd ~/
+
+
+>> Create a undercloud as docker repo, Pull all docker images which are required (Including ceph)
+# openstack overcloud container image prepare   --namespace=registry.access.redhat.com/rhosp13   --push-destination=192.168.24.1:8787   --prefix=openstack-   --tag-from-label {version}-{release} -e /usr/share/openstack-tripleo-heat-templates/environments/ceph-ansible/ceph-ansible.yaml --set ceph_namespace=registry.access.redhat.com/rhceph --set ceph_image=rhceph-3-rhel7  --output-env-file=/home/stack/templates/overcloud_images.yaml   --output-images-file /home/stack/local_registry_images.yaml
+
+>> Upload docker container to undercloud
+# sudo openstack overcloud container image upload --config-file  /home/stack/local_registry_images.yaml --verbose
+
+
+
+
+=====================================================================================
+Pre-provision node deployment
+
+
+~~~~~~~
+# openstack overcloud deploy --templates /home/stack/templates/openstack-tripleo-heat-templates/ --disable-validations -e /home/stack/templates/openstack-tripleo-heat-templates/environments/deployed-server-environment.yaml -e /home/stack/templates/openstack-tripleo-heat-templates/environments/deployed-server-bootstrap-environment-rhel.yaml -e /home/stack/templates/openstack-tripleo-heat-templates/environments/deployed-server-pacemaker-environment.yaml -r /home/stack/templates/openstack-tripleo-heat-templates/deployed-server/deployed-server-roles-data.yaml -e /home/stack/templates/openstack-tripleo-heat-templates/environments/network-isolation.yaml -e /home/stack/templates/openstack-tripleo-heat-templates/environments/network-environment.yaml -e /home/stack/templates/ctlplane-assignments.yaml
+~~~~~~~~

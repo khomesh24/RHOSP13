@@ -1,0 +1,218 @@
+Create base infra using infrared
+https://gitlab.cee.redhat.com/jsaucier/osp12-sbr-hackfest/blob/master/preps/build_env_osp12.md
+
+
+To create infra
+# infrared virsh --host-address $YOURLABSERVER --host-key ~/.ssh/key_sbr_hackfest --topology-nodes undercloud:1,controller:1,compute:1,ceph:1 -e override.controller.cpu=4 -e override.controller.memory=12288 -e override.undercloud.disks.disk1.size=60G --image-url http://download-node-02.eng.bos.redhat.com/brewroot/packages/rhel-guest-image/7.4/268/images/rhel-guest-image-7.4-268.x86_64.qcow2
+
+>> setup vbmc
+
+Install python-virtualbmc
+
+# vi /usr/lib/systemd/system/virtualbmc\@.service
+
+        [Unit]
+        Description=VirtualBMC %i service
+        After=network.target libvirtd.services
+        [Service]
+        Type=forking
+        PIDFile=/root/.vbmc/%i/pid
+        ExecStart=/bin/vbmc start %i
+        ExecStop=/bin/vbmc stop %i
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+
+
+to add vm in virtualbmc
+# vbmc add controller-0 --port 6230 --username admin --password redhat && systemctl enable --now virtualbmc@controller-0
+
+
+
+>> Ssh to undercloud:
+Get undercloud IP
+# virsh domifaddr undercloud-0
+
+echo" <undercloud ip>       undercloud.example.com undercloud  "   >> /etc/hosts
+
+ssh root@undercloud
+
+
+>> Install Director
+
+
+>> Creating user and giving root privileges
+# useradd stack
+# passwd stack
+# echo "stack ALL=(root) NOPASSWD:ALL" | tee -a /etc/sudoers.d/stack
+# chmod 0440 /etc/sudoers.d/stack
+# su - stack
+
+Create image and template dir for storing image and templates
+
+# mkdir ~/images
+# mkdir ~/templates
+
+
+>> Setting up Hostname
+
+# sudo hostnamectl set-hostname undercloud.example.com
+# sudo hostnamectl set-hostname --transient undercloud.example.com
+
+
+
+>> Adding subscription and enabling repo
+
+# sudo subscription-manager register
+# sudo subscription-manager list --available --all --matches="Red Hat OpenStack"
+# sudo subscription-manager attach --pool=Valid-Pool-Number-123456
+# sudo subscription-manager repos --disable=*
+# sudo subscription-manager repos --enable=rhel-7-server-rpms --enable=rhel-7-server-extras-rpms --enable=rhel-7-server-rh-common-rpms --enable=rhel-ha-for-rhel-7-server-rpms --enable=rhel-7-server-openstack-13-rpms
+
+
+
+
+>> Install tripleo packages and ceph-ansible packages
+
+# sudo yum install -y python-tripleoclient ceph-ansible
+
+
+
+
+>> Write undercloud.conf file
+
+# vi undercloud.conf
+          [DEFAULT]
+          # Network interface on the Undercloud that will be handling the PXE
+          # boots and DHCP for Overcloud instances. (string value)
+          local_interface = eth1
+          local_ip = 192.168.24.1/24
+          undercloud_public_host = 192.168.24.2
+          undercloud_admin_host = 192.168.24.3
+          undercloud_ntp_servers=clock.redhat.com
+          [ctlplane-subnet]
+          local_subnet = ctlplane-subnet
+          cidr = 192.168.24.0/24
+          dhcp_start = 192.168.24.5
+          dhcp_end = 192.168.24.24
+          gateway = 192.168.24.1
+          inspection_iprange = 192.168.24.100,192.168.24.120
+          masquerade = true
+
+
+>> Install undercloud
+
+#  openstack undercloud install
+
+
+
+>> Download overcloud images and upload and extract and upload
+
+# source ~/stackrc
+# sudo yum install rhosp-director-images rhosp-director-images-ipa -y
+# cd ~/images
+# for i in /usr/share/rhosp-director-images/overcloud-full-latest-13.0.tar /usr/share/rhosp-director-images/ironic-python-agent-latest-13.0.tar; do tar -xvf $i; done
+# openstack overcloud image upload --image-path /home/stack/images/
+
+
+
+
+
+>> Set namespace to ctlplane-subnet
+# openstack subnet set --dns-nameserver 8.8.8.8 ctlplane-subnet
+
+# cd ~/
+
+>> Create a undercloud as docker repo, Pull all docker images which are required (Including ceph)
+# openstack overcloud container image prepare   --namespace=registry.access.redhat.com/rhosp13   --push-destination=192.168.24.1:8787   --prefix=openstack-   --tag-from-label {version}-{release} -e /usr/share/openstack-tripleo-heat-templates/environments/ceph-ansible/ceph-ansible.yaml --set ceph_namespace=registry.access.redhat.com/rhceph --set ceph_image=rhceph-3-rhel7  --output-env-file=/home/stack/templates/overcloud_images.yaml   --output-images-file /home/stack/local_registry_images.yaml
+
+>> Upload docker container to undercloud
+# sudo openstack overcloud container image upload --config-file  /home/stack/local_registry_images.yaml --verbose
+
+
+
+# vi instackenv.json
+          {
+          "nodes": [
+          {
+          "pm_user": "admin",
+          "mac": [
+          "52:54:00:3a:df:08"
+          ],
+          "pm_type": "pxe_ipmitool",
+          "pm_port": "6230",
+          "pm_password": "redhat",
+          "pm_addr": "192.168.24.254",
+          "capabilities": "profile:control",
+          "name": "controller-0"
+          },
+          {
+          "pm_user": "admin",
+          "mac": [
+          "52:54:00:bd:ac:f0"
+          ],
+          "pm_type": "pxe_ipmitool",
+          "pm_port": "6231",
+          "pm_password": "redhat",
+          "pm_addr": "192.168.24.254",
+          "capabilities": "profile:compute",
+          "name": "compute-0"
+          },
+          {
+          "pm_user": "admin",
+          "mac": [
+          "52:54:00:48:0d:0f"
+          ],
+          "pm_type": "pxe_ipmitool",
+          "pm_port": "6232",
+          "pm_password": "redhat",
+          "pm_addr": "192.168.24.254",
+          "capabilities": "profile:ceph-storage",
+          "name": "ceph-0"
+          }
+          ]
+          }
+
+# openstack overcloud node import <path of instack env file>
+
+
+
+# openstack baremetal introspection data save 1a4e30da-b6dc-499d-ba87-0bd8a3819bc0 | jq ".inventory.disks"
+
+# openstack baremetal node set --property root_device='{"serial": "Disk serial number"}' ceph-0
+
+
+# Openstack overcloud node introspect --all-manageable --provide
+
+# openstack baremetal node show ceph-0/compute-0/controller-0
+
+
+
+add templates files
+
+NOTE:  Things to checks
+*   Check profiles tags
+*   check the flavor of all baremetal node
+*   Check all baremetal node are in available state
+*   recheck environment file properly
+
+
+# openstack overcloud deploy --timeout 100 --templates /usr/share/openstack-tripleo-heat-templates --stack overcloud --libvirt-type kvm --ntp-server 10.74.128.97 \
+-e /home/stack/virt/internal.yaml -e /usr/share/openstack-tripleo-heat-templates/environments/network-isolation.yaml -e /home/stack/virt/network/network-environment.yaml -e /home/stack/virt/hostnames.yml -e /usr/share/openstack-tripleo-heat-templates/environments/ceph-ansible/ceph-ansible.yaml -e /home/stack/virt/debug.yaml -e /home/stack/virt/nodes_data.yaml -e /home/stack/virt/overcloud_images.yaml --log-file overcloud_deployment_35.log
+
+
+
+
+
+
+=====================================================================================
+Pre-provision node deployment
+
+
+~~~~~~~
+# openstack overcloud deploy --templates /home/stack/templates/openstack-tripleo-heat-templates/ --disable-validations -e /home/stack/templates/openstack-tripleo-heat-templates/environments/deployed-server-environment.yaml -e /home/stack/templates/openstack-tripleo-heat-templates/environments/deployed-server-bootstrap-environment-rhel.yaml -e /home/stack/templates/openstack-tripleo-heat-templates/environments/deployed-server-pacemaker-environment.yaml -r /home/stack/templates/openstack-tripleo-heat-templates/deployed-server/deployed-server-roles-data.yaml -e /home/stack/templates/openstack-tripleo-heat-templates/environments/network-isolation.yaml -e /home/stack/templates/openstack-tripleo-heat-templates/environments/network-environment.yaml -e /home/stack/templates/ctlplane-assignments.yaml
+~~~~~~~~
+
+openstack overcloud deploy --templates /usr/share/openstack-tripleo-heat-templates/ --disable-validations  -e /usr/share/openstack-tripleo-heat-templates/environments/deployed-server-environment.yaml  -e /usr/share/openstack-tripleo-heat-templates/environments/deployed-server-bootstrap-environment-rhel.yaml -e /usr/share/openstack-tripleo-heat-templates/environments/deployed-server-pacemaker-environment.yaml -r /usr/share/openstack-tripleo-heat-templates/deployed-server/deployed-server-roles-data.yaml -e /usr/share/openstack-tripleo-heat-templates/environments/network-isolation.yaml -e /home/stack/templates/network-environment.yaml  -e /home/stack/templates/ctlplane-assignments.yaml  --ntp-server 192.168.122.142
+roo
+~~~~~~~~~~~~~~
